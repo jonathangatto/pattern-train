@@ -1,3 +1,15 @@
 yt-dlp
 google-cloud-storage
 python-dotenv
+
+# ML pipeline
+torch
+torchaudio
+transformers>=4.38.0
+accelerate
+scikit-learn
+pandas
+numpy
+tqdm
+peft
+tensorboard
