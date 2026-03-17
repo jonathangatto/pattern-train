@@ -4,15 +4,15 @@ Extract MERT embeddings for all clips and save them to disk.
 Reads dbo-moments-2-live.1772538551.csv directly, filters rows to those
 with a downloaded audio file, binarises the 9 pattern label columns,
 performs a song-level stratified train/val/test split, then runs the
-frozen MERT-v1-95M encoder on each clip and saves the raw frame
-embeddings (T × 768) — no pooling — so downstream models can apply their
+frozen MERT-v1-330M encoder on each clip and saves the raw frame
+embeddings (T × 1024) — no pooling — so downstream models can apply their
 own temporal operations.
 
 Each clip is 3 seconds: 1 second before the annotated moment, the
 annotated second itself, and 1 second after. Boundaries are zero-padded.
 
 Outputs:
-    data/embeddings_train.pt   → {"frames": Tensor(N,T,768), "labels": Tensor(N,9), "ids": list}
+    data/embeddings_train.pt   → {"frames": Tensor(N,T,1024), "labels": Tensor(N,9), "ids": list}
     data/embeddings_val.pt
     data/embeddings_test.pt
     data/dataset_summary.json  → label metadata used by training scripts
@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -43,19 +44,19 @@ CSV_PATH     = DATA_DIR / "dbo-moments-2-live.1772538551.csv"
 AUDIO_DIR    = DATA_DIR / "audio"
 SUMMARY_PATH = DATA_DIR / "dataset_summary.json"
 
-MERT_MODEL      = "m-a-p/MERT-v1-95M"
+MERT_MODEL      = "m-a-p/MERT-v1-330M"
 SAMPLE_RATE     = 24_000   # MERT's native sample rate
-EMBED_DIM       = 768      # MERT hidden size per frame
+EMBED_DIM       = 1024      # MERT hidden size per frame
 
 # Clip window: [moment_secs - CONTEXT_BEFORE, moment_secs + ANNOT_SECONDS + CONTEXT_AFTER]
-ANNOT_SECONDS   = 1.0      # the annotated second
-CONTEXT_BEFORE  = 1.0      # seconds of context before the annotation
-CONTEXT_AFTER   = 1.0      # seconds of context after the annotation
+ANNOT_SECONDS   = 2.0      # the annotated second
+CONTEXT_BEFORE  = 2.0      # seconds of context before the annotation
+CONTEXT_AFTER   = 2.0      # seconds of context after the annotation
 CLIP_SECONDS    = CONTEXT_BEFORE + ANNOT_SECONDS + CONTEXT_AFTER  # 3.0 s total
 
 LABEL_COLS   = ["ANT", "SPR", "PDX", "AGR", "ALR", "GRF", "HRM", "SZE", "PXY"]
-VAL_RATIO    = 0.15
-TEST_RATIO   = 0.15
+VAL_RATIO    = 0.10
+TEST_RATIO   = 0.10
 RANDOM_SEED  = 42
 
 
@@ -82,13 +83,71 @@ def _audio_path(row_id) -> str | None:
     return None
 
 
+def _add_negatives(df: pd.DataFrame, rng: random.Random) -> pd.DataFrame:
+    """For each annotated moment, add one random moment from the same song
+    whose full clip window does not overlap any annotated window.
+
+    The negative row has all label columns set to 0.
+    Song membership (train/val/test) is preserved because candidates are drawn
+    only from songs already present in `df`.
+    """
+    # Half-open annotated window for a moment m:
+    #   [m - CONTEXT_BEFORE,  m + ANNOT_SECONDS + CONTEXT_AFTER)
+    # Two windows overlap when |c - m| < CLIP_SECONDS, so the minimum
+    # safe distance between any candidate c and any annotated moment m is
+    # CLIP_SECONDS (== CONTEXT_BEFORE + ANNOT_SECONDS + CONTEXT_AFTER).
+    MIN_DIST   = CLIP_SECONDS          # seconds; guarantees zero window overlap
+    MAX_TRIES  = 200                   # attempts per annotation before giving up
+
+    neg_rows = []
+
+    for song_id, group in df.groupby("id"):
+        annotated = group["moment_secs"].tolist()
+        audio_path = group["audio_path"].iloc[0]
+
+        # Determine usable song length
+        song_len = group["song_length_secs"].dropna()
+        if len(song_len) > 0:
+            duration = float(song_len.iloc[0])
+        else:
+            # Fall back: last annotation + full clip width
+            duration = max(annotated) + CLIP_SECONDS
+
+        # Valid candidate range so the full clip fits inside the song
+        c_min = CONTEXT_BEFORE
+        c_max = duration - ANNOT_SECONDS - CONTEXT_AFTER
+        if c_max <= c_min:
+            continue  # song too short to fit even one clip
+
+        for _ in annotated:          # one negative per annotation
+            for attempt in range(MAX_TRIES):
+                c = rng.uniform(c_min, c_max)
+                # Reject if candidate window overlaps any annotated window
+                if all(abs(c - m) >= MIN_DIST for m in annotated):
+                    neg_rows.append({
+                        "id":              song_id,
+                        "moment_secs":     c,
+                        "song_length_secs": duration,
+                        "audio_path":      audio_path,
+                        **{col: 0 for col in LABEL_COLS},
+                    })
+                    break
+            # If MAX_TRIES exhausted without a valid candidate, skip silently
+
+    if not neg_rows:
+        return df
+
+    df_neg = pd.DataFrame(neg_rows, columns=df.columns)
+    return pd.concat([df, df_neg], ignore_index=True)
+
+
 def build_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
     """Load CSV, filter, binarise labels, split by song id.
 
     Returns (df_train, df_val, df_test, label_cols).
     """
     print(f"Loading CSV: {CSV_PATH}")
-    df = pd.read_csv(CSV_PATH, low_memory=False, on_bad_lines='skip')
+    df = pd.read_csv(CSV_PATH, low_memory=False)
     print(f"  Total rows: {len(df)}")
 
     # Filter to rows with a downloaded audio file
@@ -136,7 +195,13 @@ def build_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]
     df_val   = df[df["id"].isin(trainval_ids[val_idx2])].reset_index(drop=True)
     df_test  = df[df["id"].isin(song_ids[test_idx])].reset_index(drop=True)
 
-    print(f"\nSplit → train: {len(df_train)}  val: {len(df_val)}  test: {len(df_test)} clips")
+    # Add one annotation-free negative sample per annotation, per split.
+    rng = random.Random(RANDOM_SEED)
+    df_train = _add_negatives(df_train, rng)
+    df_val   = _add_negatives(df_val,   rng)
+    df_test  = _add_negatives(df_test,  rng)
+
+    print(f"\nSplit (with negatives) → train: {len(df_train)}  val: {len(df_val)}  test: {len(df_test)} clips")
     return df_train, df_val, df_test, LABEL_COLS
 
 
@@ -221,6 +286,7 @@ def extract_split(
     out_path     : Path,
     batch_size   : int,
     device       : torch.device,
+    layer        : str = "last",
 ) -> None:
     dataset = ClipDataset(meta_df, label_cols)
     loader  = DataLoader(
@@ -231,6 +297,8 @@ def extract_split(
         collate_fn=collate_fn,
         pin_memory=(device.type == "cuda"),
     )
+
+    use_hidden_states = (layer != "last")
 
     all_embeddings = []
     all_labels     = []
@@ -246,9 +314,18 @@ def extract_split(
         )
         input_values = inputs["input_values"].to(device)
 
-        outputs = model(input_values, output_hidden_states=False)
-        # last_hidden_state: (B, T, 768) — keep raw frames, no pooling
-        hidden = outputs.last_hidden_state.cpu()  # (B, T, D)
+        outputs = model(input_values, output_hidden_states=use_hidden_states)
+
+        if layer == "last":
+            hidden = outputs.last_hidden_state.cpu()  # (B, T, D)
+        elif layer == "all":
+            # Average all hidden states (feature extractor output + transformer layers)
+            stacked = torch.stack(outputs.hidden_states, dim=0)  # (L, B, T, D)
+            hidden = stacked.mean(dim=0).cpu()  # (B, T, D)
+        else:
+            # Specific layer index
+            layer_idx = int(layer)
+            hidden = outputs.hidden_states[layer_idx].cpu()  # (B, T, D)
 
         all_embeddings.append(hidden)
         all_labels.append(labels)
@@ -271,6 +348,10 @@ def extract_split(
 def parse_args():
     p = argparse.ArgumentParser(description="Extract MERT embeddings for all splits")
     p.add_argument("--batch-size", type=int,   default=16)
+    p.add_argument("--layer",      type=str,   default="last",
+                   help="Which hidden layer to extract: 'last' (default), 'all' "
+                        "(average all layers), or an integer index (0 = feature "
+                        "extractor output, 1..24 = transformer layers)")
     p.add_argument("--device",     type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -301,6 +382,7 @@ def main() -> None:
     model.to(device)
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"  Parameters: {total_params:.1f}M")
+    print(f"  Layer selection: {args.layer}")
 
     # Process each split
     for meta_df, out_path in [
@@ -309,7 +391,7 @@ def main() -> None:
         (df_test,  DATA_DIR / "embeddings_test.pt"),
     ]:
         print(f"\nProcessing {out_path.name} ({len(meta_df)} clips)")
-        extract_split(meta_df, label_cols, processor, model, out_path, args.batch_size, device)
+        extract_split(meta_df, label_cols, processor, model, out_path, args.batch_size, device, layer=args.layer)
 
     print("\nDone.")
 

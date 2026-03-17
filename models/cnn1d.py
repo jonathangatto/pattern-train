@@ -53,6 +53,10 @@ class CNN1DClassifier(nn.Module):
     ):
         super().__init__()
 
+        # Normalise MERT frame embeddings — they have large per-dim variance
+        # that causes the conv projection to blow up before BN stabilises.
+        self.input_norm = nn.LayerNorm(in_dim)
+
         # 1×1 conv to project from MERT hidden dim to working channel width
         self.proj    = nn.Conv1d(in_dim, channels, kernel_size=1)
         self.bn_proj = nn.BatchNorm1d(channels)
@@ -68,7 +72,8 @@ class CNN1DClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D) → (B, D, T) for Conv1d
+        # x: (B, T, D) → normalise → (B, D, T) for Conv1d
+        x = self.input_norm(x)
         x = x.permute(0, 2, 1)
         x = F.relu(self.bn_proj(self.proj(x)))  # (B, C, T)
         x = self.blocks(x)                       # (B, C, T)
