@@ -26,7 +26,9 @@ from sklearn.metrics import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import build_model
+from split_utils import load_embeddings, holdout_split
 
 # ---------------------------------------------------------------------------
 # Config
@@ -44,6 +46,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="Evaluate classifier on test set")
     p.add_argument("--threshold", type=float, default=None,
                    help="Decision threshold (default: value from config.json)")
+    p.add_argument("--val-ratio",  type=float, default=0.10,
+                   help="Validation ratio used during training (default: 0.10)")
+    p.add_argument("--test-ratio", type=float, default=0.10,
+                   help="Test ratio used during training (default: 0.10)")
+    p.add_argument("--seed",       type=int,   default=42,
+                   help="Random seed for splitting (default: 42)")
     p.add_argument("--device",    type=str,   default="cpu")
     return p.parse_args()
 
@@ -74,13 +82,14 @@ def main() -> None:
     model.eval()
     model.to(device)
 
-    # Load test frame embeddings
-    test_path = DATA_DIR / "embeddings_test.pt"
-    if not test_path.exists():
-        raise FileNotFoundError(f"{test_path} not found – run extract_embeddings.py first")
-    test_data = torch.load(test_path, weights_only=False)
-    X_test = test_data["frames"].float().to(device)
-    y_test = test_data["labels"].float()
+    # Load unified embeddings and extract test set via holdout split
+    data = load_embeddings()
+    _, _, test_idx = holdout_split(
+        data["urls"], data["labels"],
+        val_ratio=args.val_ratio, test_ratio=args.test_ratio, seed=args.seed,
+        tastes_ids=data.get("tastes_ids"))
+    X_test = data["frames"][test_idx].float().to(device)
+    y_test = data["labels"][test_idx].float()
 
     print(f"\nTest clips: {X_test.shape[0]}")
 

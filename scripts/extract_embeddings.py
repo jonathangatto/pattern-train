@@ -1,20 +1,22 @@
 """
-Extract MERT embeddings for all clips and save them to disk.
+Extract MERT embeddings for all clips and save them to a single file.
 
-Reads dbo-moments-2-live.1772538551.csv directly, filters rows to those
-with a downloaded audio file, binarises the 9 pattern label columns,
-performs a song-level stratified train/val/test split, then runs the
-frozen MERT-v1-330M encoder on each clip and saves the raw frame
+Reads the annotations CSV, filters rows to those with a downloaded audio
+file, binarises the 9 pattern label columns, adds negative samples, then
+runs the frozen MERT-v1-330M encoder on each clip and saves the raw frame
 embeddings (T × 1024) — no pooling — so downstream models can apply their
 own temporal operations.
 
-Each clip is 3 seconds: 1 second before the annotated moment, the
-annotated second itself, and 1 second after. Boundaries are zero-padded.
+Train/val/test splitting is deferred to training time (see split_utils.py)
+so that different split strategies (holdout, cross-validation) can be
+explored without re-extracting embeddings.
+
+Each clip window: CONTEXT_BEFORE + ANNOT_SECONDS + CONTEXT_AFTER seconds.
+Boundaries are zero-padded.
 
 Outputs:
-    data/embeddings_train.pt   → {"frames": Tensor(N,T,1024), "labels": Tensor(N,9), "ids": list}
-    data/embeddings_val.pt
-    data/embeddings_test.pt
+    data/embeddings_all.pt     → {"frames": Tensor(N,T,1024), "labels": Tensor(N,9),
+                                   "urls": list[str], "ids": list}
     data/dataset_summary.json  → label metadata used by training scripts
 
 Usage:
@@ -30,7 +32,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import Wav2Vec2FeatureExtractor, AutoModel
@@ -40,7 +41,7 @@ from transformers import Wav2Vec2FeatureExtractor, AutoModel
 # ---------------------------------------------------------------------------
 REPO_ROOT    = Path(__file__).resolve().parent.parent
 DATA_DIR     = REPO_ROOT / "data"
-CSV_PATH     = DATA_DIR / "dbo-moments-2-live.1772538551.csv"
+CSV_PATH     = DATA_DIR / "dbo-moments-2-live.1774458459.csv"
 AUDIO_DIR    = DATA_DIR / "audio"
 SUMMARY_PATH = DATA_DIR / "dataset_summary.json"
 
@@ -55,9 +56,8 @@ CONTEXT_AFTER   = 2.0      # seconds of context after the annotation
 CLIP_SECONDS    = CONTEXT_BEFORE + ANNOT_SECONDS + CONTEXT_AFTER  # 3.0 s total
 
 LABEL_COLS   = ["ANT", "SPR", "PDX", "AGR", "ALR", "GRF", "HRM", "SZE", "PXY"]
-VAL_RATIO    = 0.10
-TEST_RATIO   = 0.10
 RANDOM_SEED  = 42
+NEGATIVES_PER_ANNOTATION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -75,16 +75,24 @@ def _binarise(value) -> int:
 
 
 def _audio_path(row_id) -> str | None:
-    """Return path to audio file for this id, or None if not present."""
+    """Return path to audio file for this id, or None if not present.
+
+    Tries exact names first: {row_id}.mp3 / {row_id}.webm.
+    Falls back to prefixed variants: {row_id}_*.mp3 / {row_id}_*.webm.
+    """
     for ext in ("mp3", "webm"):
         p = AUDIO_DIR / f"{row_id}.{ext}"
         if p.exists():
             return str(p)
+
+        prefixed_matches = sorted(AUDIO_DIR.glob(f"{row_id}_*.{ext}"))
+        if prefixed_matches:
+            return str(prefixed_matches[0])
     return None
 
 
 def _add_negatives(df: pd.DataFrame, rng: random.Random) -> pd.DataFrame:
-    """For each annotated moment, add one random moment from the same song
+    """For each annotated moment, add random moments from the same song URL
     whose full clip window does not overlap any annotated window.
 
     The negative row has all label columns set to 0.
@@ -101,9 +109,10 @@ def _add_negatives(df: pd.DataFrame, rng: random.Random) -> pd.DataFrame:
 
     neg_rows = []
 
-    for song_id, group in df.groupby("id"):
+    for song_url, group in df.groupby("URL"):
         annotated = group["moment_secs"].tolist()
         audio_path = group["audio_path"].iloc[0]
+        row_id = group["id"].iloc[0]
 
         # Determine usable song length
         song_len = group["song_length_secs"].dropna()
@@ -119,20 +128,23 @@ def _add_negatives(df: pd.DataFrame, rng: random.Random) -> pd.DataFrame:
         if c_max <= c_min:
             continue  # song too short to fit even one clip
 
-        for _ in annotated:          # one negative per annotation
-            for attempt in range(MAX_TRIES):
-                c = rng.uniform(c_min, c_max)
-                # Reject if candidate window overlaps any annotated window
-                if all(abs(c - m) >= MIN_DIST for m in annotated):
-                    neg_rows.append({
-                        "id":              song_id,
-                        "moment_secs":     c,
-                        "song_length_secs": duration,
-                        "audio_path":      audio_path,
-                        **{col: 0 for col in LABEL_COLS},
-                    })
-                    break
-            # If MAX_TRIES exhausted without a valid candidate, skip silently
+        for _ in annotated:
+            for _ in range(NEGATIVES_PER_ANNOTATION):
+                for attempt in range(MAX_TRIES):
+                    c = rng.uniform(c_min, c_max)
+                    # Reject if candidate window overlaps any annotated window
+                    if all(abs(c - m) >= MIN_DIST for m in annotated):
+                        neg_rows.append({
+                            "id":              row_id,
+                            "URL":             song_url,
+                            "tastes_id":       group["tastes_id"].iloc[0],
+                            "moment_secs":     c,
+                            "song_length_secs": duration,
+                            "audio_path":      audio_path,
+                            **{col: 0 for col in LABEL_COLS},
+                        })
+                        break
+                # If MAX_TRIES exhausted without a valid candidate, skip silently
 
     if not neg_rows:
         return df
@@ -141,10 +153,11 @@ def _add_negatives(df: pd.DataFrame, rng: random.Random) -> pd.DataFrame:
     return pd.concat([df, df_neg], ignore_index=True)
 
 
-def build_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
-    """Load CSV, filter, binarise labels, split by song id.
+def build_dataset() -> tuple[pd.DataFrame, list[str]]:
+    """Load CSV, filter, binarise labels, add negatives.
 
-    Returns (df_train, df_val, df_test, label_cols).
+    Splitting is deferred to training time (see split_utils.py).
+    Returns (df_all, label_cols).
     """
     print(f"Loading CSV: {CSV_PATH}")
     df = pd.read_csv(CSV_PATH, low_memory=False)
@@ -166,43 +179,44 @@ def build_splits() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]
     # Keep only useful columns
     df["moment_secs"]      = pd.to_numeric(df["moment_secs"],      errors="coerce")
     df["song_length_secs"] = pd.to_numeric(df["song_length_secs"], errors="coerce")
+    if "URL" not in df.columns:
+        raise ValueError("CSV is missing required column 'URL' for song-level grouping")
+    df["URL"] = df["URL"].fillna("").astype(str).str.strip()
+
     before = len(df)
     df = df.dropna(subset=["moment_secs"]).reset_index(drop=True)
     if before != len(df):
         print(f"  Dropped {before - len(df)} rows with missing moment_secs")
 
-    df = df[["id", "moment_secs", "song_length_secs", "audio_path"] + LABEL_COLS]
+    before_url = len(df)
+    df = df[df["URL"] != ""].reset_index(drop=True)
+    if before_url != len(df):
+        print(f"  Dropped {before_url - len(df)} rows with missing URL")
+
+    # Preserve tastes_id (genre) for stratified splitting downstream
+    if "tastes_id" in df.columns:
+        df["tastes_id"] = pd.to_numeric(df["tastes_id"], errors="coerce").fillna(-1).astype(int)
+    else:
+        print("  WARNING: column 'tastes_id' not found in CSV – genre stratification unavailable")
+        df["tastes_id"] = -1
+
+    df = df[["id", "URL", "tastes_id", "moment_secs", "song_length_secs", "audio_path"] + LABEL_COLS]
+
+    n_annotations = len(df)
+    print(f"  Annotations: {n_annotations}")
 
     print("\nLabel distribution (% positive):")
     for col in LABEL_COLS:
         print(f"  {col}: {df[col].mean() * 100:.1f}%")
 
-    # Song-level stratified split to avoid leakage
-    song_ids    = df["id"].unique()
-    song_labels = df.groupby("id")[LABEL_COLS].max().loc[song_ids].values
-
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=TEST_RATIO, random_state=RANDOM_SEED)
-    train_val_idx, test_idx = next(msss.split(song_ids, song_labels))
-
-    trainval_ids    = song_ids[train_val_idx]
-    trainval_labels = song_labels[train_val_idx]
-    val_ratio_adj   = VAL_RATIO / (1.0 - TEST_RATIO)
-
-    msss2 = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=val_ratio_adj, random_state=RANDOM_SEED)
-    train_idx2, val_idx2 = next(msss2.split(trainval_ids, trainval_labels))
-
-    df_train = df[df["id"].isin(trainval_ids[train_idx2])].reset_index(drop=True)
-    df_val   = df[df["id"].isin(trainval_ids[val_idx2])].reset_index(drop=True)
-    df_test  = df[df["id"].isin(song_ids[test_idx])].reset_index(drop=True)
-
-    # Add one annotation-free negative sample per annotation, per split.
+    # Add negatives for the full dataset (they inherit the source song's URL,
+    # so URL-level splitting keeps them in the correct split downstream).
     rng = random.Random(RANDOM_SEED)
-    df_train = _add_negatives(df_train, rng)
-    df_val   = _add_negatives(df_val,   rng)
-    df_test  = _add_negatives(df_test,  rng)
+    df = _add_negatives(df, rng)
 
-    print(f"\nSplit (with negatives) → train: {len(df_train)}  val: {len(df_val)}  test: {len(df_test)} clips")
-    return df_train, df_val, df_test, LABEL_COLS
+    print(f"\nTotal clips (with negatives): {len(df)}  "
+          f"({n_annotations} annotations + {len(df) - n_annotations} negatives)")
+    return df, LABEL_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +348,13 @@ def extract_split(
     embeddings_tensor = torch.cat(all_embeddings, dim=0)
     labels_tensor     = torch.cat(all_labels, dim=0)
 
+    # Metadata in the same order as embeddings (DataLoader with shuffle=False preserves order)
+    urls_list      = meta_df["URL"].tolist() if "URL" in meta_df.columns else []
+    tastes_id_list = meta_df["tastes_id"].tolist() if "tastes_id" in meta_df.columns else []
+
     torch.save(
-        {"frames": embeddings_tensor, "labels": labels_tensor, "ids": all_ids},
+        {"frames": embeddings_tensor, "labels": labels_tensor,
+         "urls": urls_list, "tastes_ids": tastes_id_list, "ids": all_ids},
         out_path,
     )
     print(f"  Saved {embeddings_tensor.shape[0]} clips (shape {tuple(embeddings_tensor.shape)}) to {out_path}")
@@ -347,7 +366,7 @@ def extract_split(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Extract MERT embeddings for all splits")
-    p.add_argument("--batch-size", type=int,   default=16)
+    p.add_argument("--batch-size", type=int,   default=96)
     p.add_argument("--layer",      type=str,   default="last",
                    help="Which hidden layer to extract: 'last' (default), 'all' "
                         "(average all layers), or an integer index (0 = feature "
@@ -361,14 +380,14 @@ def main() -> None:
     device = torch.device(args.device)
     print(f"Device: {device}")
 
-    # Build splits directly from the original CSV
-    df_train, df_val, df_test, label_cols = build_splits()
+    # Build full dataset (no splitting — that happens at training time)
+    df_all, label_cols = build_dataset()
 
     # Write dataset_summary.json so training scripts can read label metadata
     summary = {
         "label_cols": label_cols,
         "n_labels":   len(label_cols),
-        "splits":     {"train": len(df_train), "val": len(df_val), "test": len(df_test)},
+        "total_clips": len(df_all),
     }
     with open(SUMMARY_PATH, "w") as f:
         json.dump(summary, f, indent=2)
@@ -384,14 +403,10 @@ def main() -> None:
     print(f"  Parameters: {total_params:.1f}M")
     print(f"  Layer selection: {args.layer}")
 
-    # Process each split
-    for meta_df, out_path in [
-        (df_train, DATA_DIR / "embeddings_train.pt"),
-        (df_val,   DATA_DIR / "embeddings_val.pt"),
-        (df_test,  DATA_DIR / "embeddings_test.pt"),
-    ]:
-        print(f"\nProcessing {out_path.name} ({len(meta_df)} clips)")
-        extract_split(meta_df, label_cols, processor, model, out_path, args.batch_size, device, layer=args.layer)
+    # Extract embeddings for all clips into a single file
+    out_path = DATA_DIR / "embeddings_all.pt"
+    print(f"\nProcessing all {len(df_all)} clips")
+    extract_split(df_all, label_cols, processor, model, out_path, args.batch_size, device, layer=args.layer)
 
     print("\nDone.")
 

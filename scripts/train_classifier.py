@@ -20,6 +20,7 @@ Requires:
 
 import argparse
 import csv
+import gc
 import json
 import sys
 import time
@@ -31,9 +32,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
-# Make the repo root importable so `models/` can be found
+# Make the repo root and scripts/ importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import build_model
+from split_utils import load_embeddings, holdout_split, kfold_cv
 
 # ---------------------------------------------------------------------------
 # Config
@@ -49,9 +52,9 @@ LABEL_NAMES  = ["ANT", "SPR", "PDX", "AGR", "ALR", "GRF", "HRM", "SZE", "PXY"]
 # the full CNN/MLP — useful to verify the embeddings carry learnable signal.
 SIMPLE_MODE = False
 
-DEFAULT_MODEL      = "mlp"
+DEFAULT_MODEL      = "cnn1d"
 DEFAULT_EPOCHS     = 100
-DEFAULT_BATCH_SIZE = 128
+DEFAULT_BATCH_SIZE = 2048
 DEFAULT_LR         = 1e-5
 DEFAULT_WD         = 1e-4
 DEFAULT_DROPOUT    = 0.4
@@ -148,57 +151,29 @@ def compute_metrics(logits: torch.Tensor, labels: torch.Tensor, threshold: float
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(args) -> None:
-    device = torch.device(args.device)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, output_dir, device):
+    """Run a single training pass. Returns best validation AUROC."""
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load dataset summary for label info
-    with open(SUMMARY_PATH) as f:
-        summary = json.load(f)
-    label_cols  = summary["label_cols"]
-    n_labels    = len(label_cols)
-
-    # Load precomputed frame embeddings
-    print("Loading embeddings...")
-    train_data = torch.load(DATA_DIR / "embeddings_train.pt", weights_only=False)
-    val_data   = torch.load(DATA_DIR / "embeddings_val.pt",   weights_only=False)
-
-    X_train, y_train = train_data["frames"].float(), train_data["labels"].float()
-    X_val,   y_val   = val_data["frames"].float(),   val_data["labels"].float()
-
-    # Binary mode: collapse all 9 labels into a single presence/absence flag.
-    if args.binary:
-        y_train = (y_train.sum(dim=1, keepdim=True) > 0).float()
-        y_val   = (y_val.sum(dim=1,   keepdim=True) > 0).float()
-        label_cols = ["any_pattern"]
-        n_labels   = 1
-        print("[BINARY MODE] Predicting any-pattern-present (1) vs. none (0).")
-    # Standardise embeddings using training-set statistics.
-    # MERT-330M features have large per-dimension variance; normalising here
-    # is more reliable than relying on in-model BatchNorm/LayerNorm alone.
-    emb_mean = X_train.mean(dim=(0, 1), keepdim=True)   # (1, 1, D)
-    emb_std  = X_train.std(dim=(0, 1),  keepdim=True).clamp(min=1e-6)
-    X_train  = (X_train - emb_mean) / emb_std
-    X_val    = (X_val   - emb_mean) / emb_std
+    train_idx = torch.as_tensor(train_idx, dtype=torch.long)
+    val_idx = torch.as_tensor(val_idx, dtype=torch.long)
 
     # Tiny overfit mode: train and validate on the same tiny subset.
     # Useful to quickly verify the model/pipeline can fit anything at all.
     if args.tiny_overfit:
-        tiny_n = min(args.tiny_size, X_train.shape[0])
+        tiny_n = min(args.tiny_size, train_idx.shape[0])
         gen = torch.Generator().manual_seed(42)
-        idx = torch.randperm(X_train.shape[0], generator=gen)[:tiny_n]
-        X_tiny = X_train[idx].clone()
-        y_tiny = y_train[idx].clone()
-        X_train, y_train = X_tiny, y_tiny
-        X_val, y_val     = X_tiny.clone(), y_tiny.clone()
+        tiny_select = torch.randperm(train_idx.shape[0], generator=gen)[:tiny_n]
+        train_idx = train_idx[tiny_select]
+        val_idx = train_idx.clone()
         print(f"[TINY OVERFIT MODE] Using same {tiny_n} samples for train and val.")
-        print(f"[TINY OVERFIT MODE] Positive rate: {y_train.mean().item():.4f}")
+        print(f"[TINY OVERFIT MODE] Positive rate: {y_all[train_idx].mean().item():.4f}")
 
     # X: (N, T, D) — in_dim is the MERT hidden dim D
-    in_dim = X_train.shape[2]
+    in_dim = X_all.shape[2]
 
-    print(f"  Train: {X_train.shape[0]} clips, frames={X_train.shape[1]}, in_dim={in_dim}")
-    print(f"  Val:   {X_val.shape[0]} clips")
+    print(f"  Train: {train_idx.shape[0]} clips, frames={X_all.shape[1]}, in_dim={in_dim}")
+    print(f"  Val:   {val_idx.shape[0]} clips")
 
     # Compute pos_weight per label to handle class imbalance.
     # In binary mode, force pos_weight=1.0 to keep the objective simple/stable.
@@ -206,12 +181,15 @@ def train(args) -> None:
         pos_weight = torch.ones(1, device=device)
         print("[BINARY MODE] Using pos_weight=1.0")
     else:
+        y_train = y_all[train_idx]
         pos_weight = (y_train.shape[0] - y_train.sum(0)) / (y_train.sum(0).clamp(min=1))
         pos_weight = pos_weight.clamp(max=10.0).to(device)
 
-    # DataLoaders
-    train_ds = TensorDataset(X_train, y_train)
-    val_ds   = TensorDataset(X_val, y_val)
+    # Slice tensors for this split (fast in-RAM copy)
+    X_train, y_train_ds = X_all[train_idx], y_all[train_idx]
+    X_val,   y_val_ds   = X_all[val_idx],   y_all[val_idx]
+    train_ds = TensorDataset(X_train, y_train_ds)
+    val_ds   = TensorDataset(X_val, y_val_ds)
     if args.tiny_overfit:
         train_batch_size = len(train_ds)
         val_batch_size   = len(val_ds)
@@ -220,8 +198,8 @@ def train(args) -> None:
         train_batch_size = args.batch_size
         val_batch_size   = args.batch_size
         train_shuffle = True
-    train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=train_shuffle,  pin_memory=(device.type=="cuda"))
-    val_loader   = DataLoader(val_ds,   batch_size=val_batch_size, shuffle=False, pin_memory=(device.type=="cuda"))
+    train_loader = DataLoader(train_ds, batch_size=train_batch_size, shuffle=train_shuffle)
+    val_loader   = DataLoader(val_ds,   batch_size=val_batch_size, shuffle=False)
 
     # Model, loss, optimiser
     if args.tiny_overfit:
@@ -245,7 +223,7 @@ def train(args) -> None:
     print(f"Training on: {device}\n")
 
     # Log file
-    log_path = MODEL_DIR / "training_log.csv"
+    log_path = output_dir / "training_log.csv"
     log_header = ["epoch", "train_loss", "val_loss", "macro_auroc", "macro_f1", "micro_f1"] + \
                  [f"f1_{c}" for c in label_cols]
 
@@ -265,7 +243,8 @@ def train(args) -> None:
             inner_steps = args.tiny_inner_steps if args.tiny_overfit else 1
             for _ in range(inner_steps):
                 for X_batch, y_batch in train_loader:
-                    X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                    X_batch = X_batch.to(device, non_blocking=True)
+                    y_batch = y_batch.to(device, non_blocking=True)
                     optimiser.zero_grad()
                     logits = model(X_batch)
                     loss   = criterion(logits, y_batch)
@@ -283,7 +262,8 @@ def train(args) -> None:
             all_labels = []
             with torch.no_grad():
                 for X_batch, y_batch in val_loader:
-                    X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                    X_batch = X_batch.to(device, non_blocking=True)
+                    y_batch = y_batch.to(device, non_blocking=True)
                     logits = model(X_batch)
                     val_loss += criterion(logits, y_batch).item() * X_batch.size(0)
                     all_logits.append(logits.cpu())
@@ -314,7 +294,7 @@ def train(args) -> None:
             if metrics["macro_auroc"] > best_val_f1:
                 best_val_f1 = metrics["macro_auroc"]
                 patience_ctr = 0
-                torch.save(model.state_dict(), MODEL_DIR / "best_model.pt")
+                torch.save(model.state_dict(), output_dir / "best_model.pt")
                 print(f"  ✓ New best macro_auroc={best_val_f1:.4f} – saved checkpoint")
             else:
                 patience_ctr += 1
@@ -344,13 +324,94 @@ def train(args) -> None:
             "dropout":    args.dropout,
         },
     }
-    with open(MODEL_DIR / "config.json", "w") as f:
+    with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
 
     print(f"\nTraining complete. Best val macro_auroc: {best_val_f1:.4f}")
-    print(f"Checkpoint: {MODEL_DIR / 'best_model.pt'}")
-    print(f"Config:     {MODEL_DIR / 'config.json'}")
+    print(f"Checkpoint: {output_dir / 'best_model.pt'}")
+    print(f"Config:     {output_dir / 'config.json'}")
     print(f"Log:        {log_path}")
+
+    return best_val_f1
+
+
+def train(args) -> None:
+    device = torch.device(args.device)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load dataset summary for label info
+    with open(SUMMARY_PATH) as f:
+        summary = json.load(f)
+    label_cols  = summary["label_cols"]
+    n_labels    = len(label_cols)
+
+    # Load unified embeddings (splitting happens here, not at extraction time)
+    print("Loading embeddings...")
+    data = load_embeddings()
+    X_all = data["frames"].float()
+    y_all = data["labels"].float()
+    urls  = data["urls"]
+    tastes_ids = data.get("tastes_ids")
+
+    # Binary mode: collapse all 9 labels into a single presence/absence flag.
+    if args.binary:
+        y_all = (y_all.sum(dim=1, keepdim=True) > 0).float()
+        label_cols = ["any_pattern"]
+        n_labels   = 1
+        print("[BINARY MODE] Predicting any-pattern-present (1) vs. none (0).")
+
+    if args.split_strategy == "holdout":
+        train_idx, val_idx, _ = holdout_split(
+            urls, y_all, val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio, seed=args.seed,
+            tastes_ids=tastes_ids)
+        print(f"Holdout split → train: {len(train_idx)}  val: {len(val_idx)}")
+        _run_training(X_all, y_all, train_idx, val_idx,
+                      args, label_cols, n_labels, MODEL_DIR, device)
+
+    elif args.split_strategy == "kfold":
+        fold_aurocs = []
+        best_overall_auroc = -1.0
+        best_fold = -1
+
+        for fold, (train_idx, val_idx) in enumerate(
+                kfold_cv(urls, y_all, n_folds=args.n_folds, seed=args.seed,
+                         tastes_ids=tastes_ids)):
+            fold_name = f"fold{fold + 1}"
+            fold_dir  = MODEL_DIR / fold_name
+            print(f"\n{'=' * 60}")
+            print(f"  {fold_name} — train: {len(train_idx)}  val: {len(val_idx)}")
+            print(f"{'=' * 60}")
+
+            auroc = _run_training(
+                X_all, y_all, train_idx, val_idx,
+                args, label_cols, n_labels, fold_dir, device)
+            fold_aurocs.append(auroc)
+            if auroc > best_overall_auroc:
+                best_overall_auroc = auroc
+                best_fold = fold + 1
+
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        # Summary
+        print(f"\n{'=' * 60}")
+        print(f"Cross-validation summary ({args.n_folds} folds):")
+        for i, auroc in enumerate(fold_aurocs):
+            marker = " ← best" if (i + 1) == best_fold else ""
+            print(f"  Fold {i + 1}: AUROC = {auroc:.4f}{marker}")
+        print(f"  Mean ± Std: {np.mean(fold_aurocs):.4f} ± {np.std(fold_aurocs):.4f}")
+        print(f"{'=' * 60}")
+
+        # Copy best fold checkpoint to the main model directory
+        import shutil
+        best_fold_dir = MODEL_DIR / f"fold{best_fold}"
+        for fname in ("best_model.pt", "config.json"):
+            src = best_fold_dir / fname
+            if src.exists():
+                shutil.copy2(src, MODEL_DIR / fname)
+        print(f"Copied best fold ({best_fold}) checkpoint to {MODEL_DIR}")
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +437,17 @@ def parse_args():
                    help="Number of optimization passes over the tiny set per epoch")
     p.add_argument("--binary",      action="store_true",
                    help="Collapse all labels to a single any-pattern-present binary target")
+    p.add_argument("--split-strategy", type=str, default="holdout",
+                   choices=["holdout", "kfold"],
+                   help="Split strategy: holdout (default) or kfold cross-validation")
+    p.add_argument("--n-folds",     type=int,   default=5,
+                   help="Number of folds for kfold strategy (default: 5)")
+    p.add_argument("--val-ratio",   type=float, default=0.10,
+                   help="Validation ratio for holdout strategy (default: 0.10)")
+    p.add_argument("--test-ratio",  type=float, default=0.10,
+                   help="Test ratio for holdout strategy (default: 0.10)")
+    p.add_argument("--seed",        type=int,   default=42,
+                   help="Random seed for splitting (default: 42)")
     p.add_argument("--device",      type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 

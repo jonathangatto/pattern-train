@@ -17,7 +17,7 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 REPO_ROOT      = Path(__file__).resolve().parent.parent
-CSV_PATH       = REPO_ROOT / "data" / "dbo-moments-2-live.1772538551.csv"
+CSV_PATH       = REPO_ROOT / "data" / "dbo-moments-2-live.1774458459.csv"
 AUDIO_DIR      = REPO_ROOT / "data" / "audio"
 ERRORS_CSV_PATH = REPO_ROOT / "data" / f"{CSV_PATH.stem}_errors{CSV_PATH.suffix}"
 
@@ -76,6 +76,11 @@ def main() -> None:
 
         if local_file.exists():
             print(f"[{idx}/{total}] SKIP  – {row_id}.mp3 already exists locally")
+            continue
+
+        prefixed_files = list(AUDIO_DIR.glob(f"{row_id}_*.mp3"))
+        if prefixed_files:
+            print(f"[{idx}/{total}] SKIP  – {prefixed_files[0].name} already exists locally (prefix match)")
             continue
 
         try:

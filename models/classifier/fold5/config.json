@@ -1,0 +1,23 @@
+{
+  "mert_model": "m-a-p/MERT-v1-330M",
+  "model_name": "cnn1d",
+  "in_dim": 1024,
+  "n_labels": 1,
+  "label_cols": [
+    "any_pattern"
+  ],
+  "binary_mode": true,
+  "tiny_overfit_mode": false,
+  "tiny_size": 256,
+  "tiny_lr_floor": 0.003,
+  "tiny_inner_steps": 20,
+  "threshold": 0.5,
+  "best_val_macro_f1": 0.8097017522692258,
+  "hyperparams": {
+    "epochs": 100,
+    "batch_size": 2048,
+    "lr": 1e-05,
+    "wd": 0.0001,
+    "dropout": 0.4
+  }
+}
