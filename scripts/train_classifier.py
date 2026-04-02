@@ -37,13 +37,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import build_model
 from split_utils import load_embeddings, holdout_split, kfold_cv
+from config import MERT_MODEL, MODEL_DIR
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 REPO_ROOT    = Path(__file__).resolve().parent.parent
 DATA_DIR     = REPO_ROOT / "data"
-MODEL_DIR    = REPO_ROOT / "models" / "classifier"
 SUMMARY_PATH = DATA_DIR / "dataset_summary.json"
 
 LABEL_NAMES  = ["ANT", "SPR", "PDX", "AGR", "ALR", "GRF", "HRM", "SZE", "PXY"]
@@ -228,6 +228,7 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
                  [f"f1_{c}" for c in label_cols]
 
     best_val_f1  = -1.0
+    best_epoch   = 0
     patience_ctr = 0
 
     with open(log_path, "w", newline="") as lf:
@@ -293,6 +294,7 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
             # Best model checkpoint — tracked on AUROC (threshold-independent)
             if metrics["macro_auroc"] > best_val_f1:
                 best_val_f1 = metrics["macro_auroc"]
+                best_epoch   = epoch
                 patience_ctr = 0
                 torch.save(model.state_dict(), output_dir / "best_model.pt")
                 print(f"  ✓ New best macro_auroc={best_val_f1:.4f} – saved checkpoint")
@@ -304,7 +306,7 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
 
     # Save config
     config = {
-        "mert_model":   "m-a-p/MERT-v1-330M",
+        "mert_model":   MERT_MODEL,
         "model_name":   args.model,
         "in_dim":       in_dim,
         "n_labels":     n_labels,
@@ -327,12 +329,12 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
 
-    print(f"\nTraining complete. Best val macro_auroc: {best_val_f1:.4f}")
+    print(f"\nTraining complete. Best val macro_auroc: {best_val_f1:.4f} (epoch {best_epoch})")
     print(f"Checkpoint: {output_dir / 'best_model.pt'}")
     print(f"Config:     {output_dir / 'config.json'}")
     print(f"Log:        {log_path}")
 
-    return best_val_f1
+    return best_val_f1, best_epoch
 
 
 def train(args) -> None:
@@ -371,6 +373,7 @@ def train(args) -> None:
 
     elif args.split_strategy == "kfold":
         fold_aurocs = []
+        fold_best_epochs = []
         best_overall_auroc = -1.0
         best_fold = -1
 
@@ -383,10 +386,11 @@ def train(args) -> None:
             print(f"  {fold_name} — train: {len(train_idx)}  val: {len(val_idx)}")
             print(f"{'=' * 60}")
 
-            auroc = _run_training(
+            auroc, best_ep = _run_training(
                 X_all, y_all, train_idx, val_idx,
                 args, label_cols, n_labels, fold_dir, device)
             fold_aurocs.append(auroc)
+            fold_best_epochs.append(best_ep)
             if auroc > best_overall_auroc:
                 best_overall_auroc = auroc
                 best_fold = fold + 1
@@ -398,20 +402,36 @@ def train(args) -> None:
         # Summary
         print(f"\n{'=' * 60}")
         print(f"Cross-validation summary ({args.n_folds} folds):")
-        for i, auroc in enumerate(fold_aurocs):
+        for i, (auroc, ep) in enumerate(zip(fold_aurocs, fold_best_epochs)):
             marker = " ← best" if (i + 1) == best_fold else ""
-            print(f"  Fold {i + 1}: AUROC = {auroc:.4f}{marker}")
+            print(f"  Fold {i + 1}: AUROC = {auroc:.4f}  (best epoch {ep}){marker}")
         print(f"  Mean ± Std: {np.mean(fold_aurocs):.4f} ± {np.std(fold_aurocs):.4f}")
         print(f"{'=' * 60}")
 
-        # Copy best fold checkpoint to the main model directory
-        import shutil
-        best_fold_dir = MODEL_DIR / f"fold{best_fold}"
-        for fname in ("best_model.pt", "config.json"):
-            src = best_fold_dir / fname
-            if src.exists():
-                shutil.copy2(src, MODEL_DIR / fname)
-        print(f"Copied best fold ({best_fold}) checkpoint to {MODEL_DIR}")
+        # --- Final retrain on (almost) all data ---
+        # Now that CV has validated the hyperparameters, retrain on as much
+        # data as possible.  A small 5% holdout is kept purely for early
+        # stopping; the rest is used for training.
+        print(f"\n{'=' * 60}")
+        print(f"  Final retrain — using ~95% of all data")
+        print(f"{'=' * 60}")
+
+        # Get a 5% stratified val set; merge the rest into train.
+        # Use a different seed so the tiny val set isn't correlated with
+        # the CV folds.
+        final_train_idx, final_val_idx, final_leftover = holdout_split(
+            urls, y_all,
+            val_ratio=0.05, test_ratio=0.05,
+            seed=args.seed + 1000,
+            tastes_ids=tastes_ids)
+        # Merge the leftover (test) slice back into training
+        final_train_idx = np.concatenate([final_train_idx, final_leftover])
+
+        _run_training(
+            X_all, y_all, final_train_idx, final_val_idx,
+            args, label_cols, n_labels, MODEL_DIR, device)
+
+        print(f"\nFinal model saved to {MODEL_DIR}")
 
 
 # ---------------------------------------------------------------------------

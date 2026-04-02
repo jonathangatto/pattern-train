@@ -29,13 +29,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import build_model
 from split_utils import load_embeddings, holdout_split
+from config import MODEL_DIR
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 REPO_ROOT  = Path(__file__).resolve().parent.parent
 DATA_DIR   = REPO_ROOT / "data"
-MODEL_DIR  = REPO_ROOT / "models" / "classifier"
 
 
 # ---------------------------------------------------------------------------

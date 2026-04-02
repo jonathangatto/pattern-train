@@ -26,6 +26,7 @@ Usage:
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import Wav2Vec2FeatureExtractor, AutoModel
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import (
+    MERT_MODEL, SAMPLE_RATE, EMBED_DIM,
+    ANNOT_SECONDS, CONTEXT_BEFORE, CONTEXT_AFTER, CLIP_SECONDS,
+)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -44,16 +51,6 @@ DATA_DIR     = REPO_ROOT / "data"
 CSV_PATH     = DATA_DIR / "dbo-moments-2-live.1774458459.csv"
 AUDIO_DIR    = DATA_DIR / "audio"
 SUMMARY_PATH = DATA_DIR / "dataset_summary.json"
-
-MERT_MODEL      = "m-a-p/MERT-v1-330M"
-SAMPLE_RATE     = 24_000   # MERT's native sample rate
-EMBED_DIM       = 1024      # MERT hidden size per frame
-
-# Clip window: [moment_secs - CONTEXT_BEFORE, moment_secs + ANNOT_SECONDS + CONTEXT_AFTER]
-ANNOT_SECONDS   = 2.0      # the annotated second
-CONTEXT_BEFORE  = 2.0      # seconds of context before the annotation
-CONTEXT_AFTER   = 2.0      # seconds of context after the annotation
-CLIP_SECONDS    = CONTEXT_BEFORE + ANNOT_SECONDS + CONTEXT_AFTER  # 3.0 s total
 
 LABEL_COLS   = ["ANT", "SPR", "PDX", "AGR", "ALR", "GRF", "HRM", "SZE", "PXY"]
 RANDOM_SEED  = 42

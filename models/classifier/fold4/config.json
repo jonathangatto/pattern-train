@@ -12,7 +12,7 @@
   "tiny_lr_floor": 0.003,
   "tiny_inner_steps": 20,
   "threshold": 0.5,
-  "best_val_macro_f1": 0.8059578472463227,
+  "best_val_macro_f1": 0.8062129087222321,
   "hyperparams": {
     "epochs": 100,
     "batch_size": 2048,
