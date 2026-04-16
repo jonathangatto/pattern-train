@@ -311,6 +311,7 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
         "in_dim":       in_dim,
         "n_labels":     n_labels,
         "label_cols":   label_cols,
+        "min_submits":  args.min_submits,
         "binary_mode":  args.binary,
         "tiny_overfit_mode": args.tiny_overfit,
         "tiny_size": args.tiny_size,
@@ -337,9 +338,16 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
     return best_val_f1, best_epoch
 
 
+def _resolve_output_dir(min_submits: int | None) -> Path:
+    if min_submits is None:
+        return MODEL_DIR
+    return MODEL_DIR / f"min_submits_{min_submits}"
+
+
 def train(args) -> None:
     device = torch.device(args.device)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _resolve_output_dir(args.min_submits)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load dataset summary for label info
     with open(SUMMARY_PATH) as f:
@@ -355,6 +363,62 @@ def train(args) -> None:
     urls  = data["urls"]
     tastes_ids = data.get("tastes_ids")
 
+    if args.min_submits is not None:
+        submits = data.get("submits")
+        if submits is None:
+            raise ValueError(
+                "Embeddings file does not contain 'submits'. "
+                "Re-run scripts/extract_embeddings.py to regenerate embeddings with submits metadata."
+            )
+
+        if len(submits) != y_all.shape[0]:
+            raise ValueError(
+                f"Length mismatch: submits has {len(submits)} entries, "
+                f"but embeddings have {y_all.shape[0]} clips."
+            )
+
+        def _to_float_or_nan(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float("nan")
+
+        submits_arr = np.array([_to_float_or_nan(v) for v in submits], dtype=float)
+        urls_arr = np.asarray(urls)
+        labels_np = y_all.numpy()
+        is_negative = labels_np.sum(axis=1) == 0
+        is_annotated = ~is_negative
+
+        keep_annotated = is_annotated & np.isfinite(submits_arr) & (submits_arr >= args.min_submits)
+        qualifying_urls = set(urls_arr[keep_annotated].tolist())
+        keep_negative = is_negative & np.array([u in qualifying_urls for u in urls_arr])
+        keep_mask = keep_annotated | keep_negative
+
+        kept = int(keep_mask.sum())
+        total = int(len(keep_mask))
+        kept_annotations = int(keep_annotated.sum())
+        kept_negatives = int(keep_negative.sum())
+
+        if kept == 0:
+            raise ValueError(
+                f"No clips remain after applying --min-submits {args.min_submits}. "
+                "Lower the threshold or regenerate embeddings/data."
+            )
+
+        keep_idx = torch.from_numpy(np.where(keep_mask)[0]).long()
+        X_all = X_all[keep_idx]
+        y_all = y_all[keep_idx]
+        urls = urls_arr[keep_mask].tolist()
+        if tastes_ids is not None:
+            tastes_ids = np.asarray(tastes_ids)[keep_mask].tolist()
+
+        print(
+            f"[MIN_SUBMITS] threshold={args.min_submits}  "
+            f"clips: {kept}/{total} kept  "
+            f"(annotations={kept_annotations}, negatives={kept_negatives})"
+        )
+        print(f"[MIN_SUBMITS] Output directory: {output_dir}")
+
     # Binary mode: collapse all 9 labels into a single presence/absence flag.
     if args.binary:
         y_all = (y_all.sum(dim=1, keepdim=True) > 0).float()
@@ -369,7 +433,7 @@ def train(args) -> None:
             tastes_ids=tastes_ids)
         print(f"Holdout split → train: {len(train_idx)}  val: {len(val_idx)}")
         _run_training(X_all, y_all, train_idx, val_idx,
-                      args, label_cols, n_labels, MODEL_DIR, device)
+                      args, label_cols, n_labels, output_dir, device)
 
     elif args.split_strategy == "kfold":
         fold_aurocs = []
@@ -381,7 +445,7 @@ def train(args) -> None:
                 kfold_cv(urls, y_all, n_folds=args.n_folds, seed=args.seed,
                          tastes_ids=tastes_ids)):
             fold_name = f"fold{fold + 1}"
-            fold_dir  = MODEL_DIR / fold_name
+            fold_dir  = output_dir / fold_name
             print(f"\n{'=' * 60}")
             print(f"  {fold_name} — train: {len(train_idx)}  val: {len(val_idx)}")
             print(f"{'=' * 60}")
@@ -429,9 +493,9 @@ def train(args) -> None:
 
         _run_training(
             X_all, y_all, final_train_idx, final_val_idx,
-            args, label_cols, n_labels, MODEL_DIR, device)
+            args, label_cols, n_labels, output_dir, device)
 
-        print(f"\nFinal model saved to {MODEL_DIR}")
+        print(f"\nFinal model saved to {output_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +532,8 @@ def parse_args():
                    help="Test ratio for holdout strategy (default: 0.10)")
     p.add_argument("--seed",        type=int,   default=42,
                    help="Random seed for splitting (default: 42)")
+    p.add_argument("--min-submits", type=int, default=None,
+                   help="Keep only clips from moments with submits >= this threshold")
     p.add_argument("--device",      type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 

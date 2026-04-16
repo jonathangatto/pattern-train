@@ -197,7 +197,7 @@ def build_dataset() -> tuple[pd.DataFrame, list[str]]:
         print("  WARNING: column 'tastes_id' not found in CSV – genre stratification unavailable")
         df["tastes_id"] = -1
 
-    df = df[["id", "URL", "tastes_id", "moment_secs", "song_length_secs", "audio_path"] + LABEL_COLS]
+    df = df[["id", "URL", "tastes_id", "moment_secs", "song_length_secs", "audio_path", "submits"] + LABEL_COLS]
 
     n_annotations = len(df)
     print(f"  Annotations: {n_annotations}")
@@ -348,10 +348,11 @@ def extract_split(
     # Metadata in the same order as embeddings (DataLoader with shuffle=False preserves order)
     urls_list      = meta_df["URL"].tolist() if "URL" in meta_df.columns else []
     tastes_id_list = meta_df["tastes_id"].tolist() if "tastes_id" in meta_df.columns else []
+    submits_list   = meta_df["submits"].tolist() if "submits" in meta_df.columns else [float("nan")] * len(meta_df)
 
     torch.save(
         {"frames": embeddings_tensor, "labels": labels_tensor,
-         "urls": urls_list, "tastes_ids": tastes_id_list, "ids": all_ids},
+         "urls": urls_list, "tastes_ids": tastes_id_list, "submits": submits_list, "ids": all_ids},
         out_path,
     )
     print(f"  Saved {embeddings_tensor.shape[0]} clips (shape {tuple(embeddings_tensor.shape)}) to {out_path}")

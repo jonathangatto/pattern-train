@@ -7,3 +7,4 @@ venv
 data/
 models/classifier/*.pt
 models/classifier/*.csv
+models/classifier/*

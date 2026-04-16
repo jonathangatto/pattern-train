@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Repository layout
 REPO_ROOT = Path(__file__).resolve().parent
-MODEL_DIR = REPO_ROOT / "models" / "classifier"
+MODEL_DIR = REPO_ROOT / "models" / "classifier" / "min_submits_93"
 
 # MERT encoder
 MERT_MODEL = "m-a-p/MERT-v1-330M"
