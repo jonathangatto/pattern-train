@@ -16,7 +16,7 @@ Boundaries are zero-padded.
 
 Outputs:
     data/embeddings_all.pt     → {"frames": Tensor(N,T,1024), "labels": Tensor(N,9),
-                                   "urls": list[str], "ids": list}
+                                   "raw_scores": Tensor(N,9), "urls": list[str], "ids": list}
     data/dataset_summary.json  → label metadata used by training scripts
 
 Usage:
@@ -53,6 +53,7 @@ AUDIO_DIR    = DATA_DIR / "audio"
 SUMMARY_PATH = DATA_DIR / "dataset_summary.json"
 
 LABEL_COLS   = ["ANT", "SPR", "PDX", "AGR", "ALR", "GRF", "HRM", "SZE", "PXY"]
+RAW_LABEL_COLS = [f"{col}_raw" for col in LABEL_COLS]
 RANDOM_SEED  = 42
 NEGATIVES_PER_ANNOTATION = 2
 
@@ -61,14 +62,22 @@ NEGATIVES_PER_ANNOTATION = 2
 # Data preparation (filtering, binarisation, splitting)
 # ---------------------------------------------------------------------------
 
-def _binarise(value) -> int:
-    """Convert raw pattern value to binary label (missing/0 → 0, else → 1)."""
+def _coerce_raw_score(value) -> float:
+    """Convert raw pattern value to a numeric score, defaulting missing values to 0."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
-        return 0
+        return 0.0
     try:
-        return 1 if float(value) >= 0.25 else 0
+        return float(value)
     except (ValueError, TypeError):
-        return 0
+        return 0.0
+
+
+def _label_from_raw_score(value: float) -> int:
+    """Convert raw pattern score to the default binary training label.
+
+    Exact positives stay positive; partial scores such as 0.5 are not promoted.
+    """
+    return 1 if value >= 1.0 else 0
 
 
 def _audio_path(row_id) -> str | None:
@@ -138,6 +147,9 @@ def _add_negatives(df: pd.DataFrame, rng: random.Random) -> pd.DataFrame:
                             "moment_secs":     c,
                             "song_length_secs": duration,
                             "audio_path":      audio_path,
+                            "submits":         group["submits"].iloc[0],
+                            "is_synthetic_negative": True,
+                            **{col: 0.0 for col in RAW_LABEL_COLS},
                             **{col: 0 for col in LABEL_COLS},
                         })
                         break
@@ -165,13 +177,16 @@ def build_dataset() -> tuple[pd.DataFrame, list[str]]:
     df = df[df["audio_path"].notna()].copy()
     print(f"  Rows with audio: {len(df)}")
 
-    # Binarise label columns
+    # Preserve raw pattern scores alongside the binary training labels.
     for col in LABEL_COLS:
+        raw_col = f"{col}_raw"
         if col not in df.columns:
             print(f"  WARNING: column '{col}' not found in CSV – filling with 0")
+            df[raw_col] = 0.0
             df[col] = 0
         else:
-            df[col] = df[col].apply(_binarise)
+            df[raw_col] = df[col].apply(_coerce_raw_score)
+            df[col] = df[raw_col].apply(_label_from_raw_score)
 
     # Keep only useful columns
     df["moment_secs"]      = pd.to_numeric(df["moment_secs"],      errors="coerce")
@@ -197,7 +212,22 @@ def build_dataset() -> tuple[pd.DataFrame, list[str]]:
         print("  WARNING: column 'tastes_id' not found in CSV – genre stratification unavailable")
         df["tastes_id"] = -1
 
-    df = df[["id", "URL", "tastes_id", "moment_secs", "song_length_secs", "audio_path", "submits"] + LABEL_COLS]
+    if "submits" in df.columns:
+        df["submits"] = pd.to_numeric(df["submits"], errors="coerce")
+    else:
+        print("  WARNING: column 'submits' not found in CSV – submit-threshold filtering unavailable")
+        df["submits"] = float("nan")
+
+    df["is_synthetic_negative"] = False
+
+    df = df[
+        [
+            "id", "URL", "tastes_id", "moment_secs", "song_length_secs",
+            "audio_path", "submits", "is_synthetic_negative",
+        ]
+        + RAW_LABEL_COLS
+        + LABEL_COLS
+    ]
 
     n_annotations = len(df)
     print(f"  Annotations: {n_annotations}")
@@ -344,15 +374,28 @@ def extract_split(
 
     embeddings_tensor = torch.cat(all_embeddings, dim=0)
     labels_tensor     = torch.cat(all_labels, dim=0)
+    raw_scores_tensor = torch.tensor(meta_df[RAW_LABEL_COLS].values.astype(float), dtype=torch.float32)
 
     # Metadata in the same order as embeddings (DataLoader with shuffle=False preserves order)
     urls_list      = meta_df["URL"].tolist() if "URL" in meta_df.columns else []
     tastes_id_list = meta_df["tastes_id"].tolist() if "tastes_id" in meta_df.columns else []
     submits_list   = meta_df["submits"].tolist() if "submits" in meta_df.columns else [float("nan")] * len(meta_df)
+    synthetic_negatives = meta_df["is_synthetic_negative"].astype(bool).tolist() \
+        if "is_synthetic_negative" in meta_df.columns else [False] * len(meta_df)
 
     torch.save(
-        {"frames": embeddings_tensor, "labels": labels_tensor,
-         "urls": urls_list, "tastes_ids": tastes_id_list, "submits": submits_list, "ids": all_ids},
+        {
+            "frames": embeddings_tensor,
+            "labels": labels_tensor,
+            "raw_scores": raw_scores_tensor,
+            "label_cols": label_cols,
+            "raw_label_cols": RAW_LABEL_COLS,
+            "urls": urls_list,
+            "tastes_ids": tastes_id_list,
+            "submits": submits_list,
+            "is_synthetic_negative": synthetic_negatives,
+            "ids": all_ids,
+        },
         out_path,
     )
     print(f"  Saved {embeddings_tensor.shape[0]} clips (shape {tuple(embeddings_tensor.shape)}) to {out_path}")
@@ -384,6 +427,7 @@ def main() -> None:
     # Write dataset_summary.json so training scripts can read label metadata
     summary = {
         "label_cols": label_cols,
+        "raw_label_cols": RAW_LABEL_COLS,
         "n_labels":   len(label_cols),
         "total_clips": len(df_all),
     }

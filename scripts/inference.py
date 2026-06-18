@@ -79,6 +79,77 @@ def extract_video_id(url: str) -> str:
     return parsed.path.strip("/").split("/")[-1] or url
 
 
+def filtered_output_path(output_path: Path) -> Path:
+    """Return the companion _filtered CSV path for an output CSV."""
+    return output_path.with_name(f"{output_path.stem}_filtered{output_path.suffix}")
+
+
+def build_prediction_rows(
+    seconds: list[int],
+    probs: torch.Tensor,
+    duration_secs: float,
+    youtube_url: str | None = None,
+) -> list[dict]:
+    """Build serializable prediction rows with overlap metadata."""
+    rows: list[dict] = []
+
+    for sec, row_probs in zip(seconds, probs.tolist()):
+        prob_values = [f"{p:.6f}" for p in row_probs]
+        rows.append(
+            {
+                "youtube_url": youtube_url,
+                "time": format_seconds(sec),
+                "prob_values": prob_values,
+                "score": max(row_probs) if row_probs else float("-inf"),
+                "interval_start": max(0.0, sec - CONTEXT_BEFORE),
+                "interval_end": min(duration_secs, sec + ANNOT_SECONDS + CONTEXT_AFTER),
+                "second": sec,
+                "status": None,
+            }
+        )
+
+    return rows
+
+
+def filter_prediction_rows(rows: list[dict]) -> list[dict]:
+    """Keep only the highest-scoring prediction among overlapping moments."""
+    ranked_rows = sorted(rows, key=lambda row: (-row["score"], row["second"]))
+    kept_rows: list[dict] = []
+
+    for row in ranked_rows:
+        overlaps_existing = any(
+            row["interval_start"] < kept["interval_end"]
+            and row["interval_end"] > kept["interval_start"]
+            for kept in kept_rows
+        )
+        if not overlaps_existing:
+            kept_rows.append(row)
+
+    return sorted(kept_rows, key=lambda row: row["second"])
+
+
+def write_results_csv(
+    output_path: Path,
+    prob_cols: list[str],
+    rows: list[dict],
+    include_youtube_url: bool,
+) -> None:
+    """Write result rows to CSV, preserving failed-download markers."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = (["youtube_url"] if include_youtube_url else []) + ["time"] + prob_cols
+        writer.writerow(header)
+
+        for row in rows:
+            prefix = [row["youtube_url"]] if include_youtube_url else []
+            if row["status"] is not None:
+                writer.writerow(prefix + [row["status"]] + [""] * len(prob_cols))
+            else:
+                writer.writerow(prefix + [row["time"]] + row["prob_values"])
+
+
 # ---------------------------------------------------------------------------
 # Audio download
 # ---------------------------------------------------------------------------
@@ -310,12 +381,13 @@ def process_audio(
     classifier: torch.nn.Module,
     batch_size: int,
     device: torch.device,
-) -> tuple[list[int], torch.Tensor]:
+) -> tuple[list[int], torch.Tensor, float]:
     """Run the full pipeline on one audio file.
 
     Returns:
         seconds: list of integer start-seconds for each window.
         probs:   (N, n_labels) tensor of probabilities.
+        duration_secs: audio duration after resampling.
     """
     waveform, duration_secs = load_waveform(audio_path)
     clips, seconds = make_windows(waveform, duration_secs)
@@ -323,7 +395,7 @@ def process_audio(
 
     embeddings = extract_embeddings(clips, processor, mert_model, batch_size, device)
     probs = run_classifier(embeddings, classifier, device)
-    return seconds, probs
+    return seconds, probs, duration_secs
 
 
 # ---------------------------------------------------------------------------
@@ -359,22 +431,22 @@ def process_single_url(
         print(f"Saved to   : {audio_path}")
 
     try:
-        seconds, probs = process_audio(
+        seconds, probs, duration_secs = process_audio(
             audio_path, processor, mert_model, classifier, args.batch_size, device
         )
 
-        # Write CSV
         output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         prob_cols = [f"prob_{lbl}" for lbl in label_cols]
+        rows = build_prediction_rows(seconds, probs, duration_secs)
+        filtered_rows = filter_prediction_rows(rows)
+        filtered_path = filtered_output_path(output_path)
 
-        with open(output_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["time"] + prob_cols)
-            for sec, row_probs in zip(seconds, probs.tolist()):
-                writer.writerow([format_seconds(sec)] + [f"{p:.6f}" for p in row_probs])
-
+        write_results_csv(output_path, prob_cols, rows, include_youtube_url=False)
+        write_results_csv(
+            filtered_path, prob_cols, filtered_rows, include_youtube_url=False
+        )
         print(f"\nResults    : {output_path}  ({len(seconds)} rows)")
+        print(f"Filtered   : {filtered_path}  ({len(filtered_rows)} rows)")
 
     finally:
         if tmp_dir is not None:
@@ -423,6 +495,7 @@ def process_csv(
     print(f"Output    : {out_path}")
 
     all_rows: list[list] = []
+    filtered_rows: list[dict] = []
 
     for i, url in enumerate(urls, 1):
         video_id   = extract_video_id(url)
@@ -440,32 +513,58 @@ def process_csv(
             except subprocess.CalledProcessError as exc:
                 err = exc.stderr.decode(errors="replace").strip()
                 print(f"  WARNING: yt-dlp failed. Error: {err}", file=sys.stderr)
-                all_rows.append([url, "DOWNLOAD_FAILED"] + [""] * len(prob_cols))
+                failed_row = {
+                    "youtube_url": url,
+                    "time": None,
+                    "prob_values": [],
+                    "score": float("-inf"),
+                    "interval_start": None,
+                    "interval_end": None,
+                    "second": -1,
+                    "status": "DOWNLOAD_FAILED",
+                }
+                all_rows.append(failed_row)
+                filtered_rows.append(failed_row)
                 continue
             except Exception as exc:  # noqa: BLE001
                 print(f"  WARNING: download error. {exc}", file=sys.stderr)
-                all_rows.append([url, "DOWNLOAD_FAILED"] + [""] * len(prob_cols))
+                failed_row = {
+                    "youtube_url": url,
+                    "time": None,
+                    "prob_values": [],
+                    "score": float("-inf"),
+                    "interval_start": None,
+                    "interval_end": None,
+                    "second": -1,
+                    "status": "DOWNLOAD_FAILED",
+                }
+                all_rows.append(failed_row)
+                filtered_rows.append(failed_row)
                 continue
 
         # Process
         try:
-            seconds, probs = process_audio(
+            seconds, probs, duration_secs = process_audio(
                 audio_path, processor, mert_model, classifier, args.batch_size, device
             )
-            for sec, row_probs in zip(seconds, probs.tolist()):
-                all_rows.append([url, format_seconds(sec)] + [f"{p:.6f}" for p in row_probs])
+            song_rows = build_prediction_rows(
+                seconds, probs, duration_secs, youtube_url=url
+            )
+            all_rows.extend(song_rows)
+            filtered_rows.extend(filter_prediction_rows(song_rows))
 
         except Exception as exc:  # noqa: BLE001
             print(f"  WARNING: processing error — skipping. {exc}", file=sys.stderr)
             continue
 
-    # Write combined results
-    with open(out_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["youtube_url", "time"] + prob_cols)
-        writer.writerows(all_rows)
+    filtered_path = filtered_output_path(out_path)
+    write_results_csv(out_path, prob_cols, all_rows, include_youtube_url=True)
+    write_results_csv(
+        filtered_path, prob_cols, filtered_rows, include_youtube_url=True
+    )
 
     print(f"\nDone. {len(all_rows)} rows written to {out_path}")
+    print(f"Filtered   : {filtered_path}  ({len(filtered_rows)} rows)")
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from models import build_model
 from split_utils import load_embeddings, holdout_split, kfold_cv
-from config import MERT_MODEL, MODEL_DIR
+from config import MERT_MODEL, MODEL_DIR, CLASSIFIER_DIR
 
 # ---------------------------------------------------------------------------
 # Config
@@ -311,6 +311,7 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
         "in_dim":       in_dim,
         "n_labels":     n_labels,
         "label_cols":   label_cols,
+        "selected_pattern": args.pattern,
         "min_submits":  args.min_submits,
         "binary_mode":  args.binary,
         "tiny_overfit_mode": args.tiny_overfit,
@@ -341,12 +342,73 @@ def _run_training(X_all, y_all, train_idx, val_idx, args, label_cols, n_labels, 
 def _resolve_output_dir(min_submits: int | None) -> Path:
     if min_submits is None:
         return MODEL_DIR
-    return MODEL_DIR / f"min_submits_{min_submits}"
+    return CLASSIFIER_DIR / f"min_submits_{min_submits}"
+
+
+def _append_pattern_subdir(output_dir: Path, pattern: str | None) -> Path:
+    if pattern is None:
+        return output_dir
+    return output_dir / f"pattern_{pattern}"
+
+
+def _pattern_index(label_cols: list[str], pattern: str) -> int:
+    try:
+        return label_cols.index(pattern)
+    except ValueError as exc:
+        raise ValueError(f"Pattern '{pattern}' not found in label columns: {label_cols}") from exc
+
+
+def _apply_keep_mask(tensor: torch.Tensor, keep_mask: np.ndarray) -> torch.Tensor:
+    keep_idx = torch.from_numpy(np.where(keep_mask)[0]).long()
+    return tensor[keep_idx]
+
+
+def _apply_pattern_filter(
+    X_all: torch.Tensor,
+    raw_scores: torch.Tensor,
+    urls,
+    tastes_ids,
+    submits,
+    synthetic_negatives,
+    label_cols: list[str],
+    pattern: str,
+):
+    pattern_idx = _pattern_index(label_cols, pattern)
+    scores = raw_scores[:, pattern_idx].numpy()
+    is_negative = np.isclose(scores, 0.0)
+    is_positive = scores >= 1.0
+    keep_mask = is_negative | is_positive
+
+    if not keep_mask.any():
+        raise ValueError(f"No clips remain after applying --pattern {pattern}.")
+
+    dropped_partial = int((~keep_mask).sum())
+    kept_positive = int(is_positive[keep_mask].sum())
+    kept_negative = int(is_negative[keep_mask].sum())
+
+    X_all = _apply_keep_mask(X_all, keep_mask)
+    y_all = torch.from_numpy(is_positive[keep_mask].astype(np.float32)).unsqueeze(1)
+    raw_scores = _apply_keep_mask(raw_scores, keep_mask)
+    urls = np.asarray(urls)[keep_mask].tolist()
+    submits = np.asarray(submits, dtype=object)[keep_mask].tolist() if submits is not None else None
+    synthetic_negatives = np.asarray(synthetic_negatives, dtype=bool)[keep_mask].tolist()
+    if tastes_ids is not None:
+        tastes_ids = np.asarray(tastes_ids)[keep_mask].tolist()
+
+    print(
+        f"[PATTERN MODE] pattern={pattern}  kept={int(keep_mask.sum())}  "
+        f"positives={kept_positive}  negatives={kept_negative}  dropped_partial={dropped_partial}"
+    )
+
+    return X_all, y_all, raw_scores, urls, tastes_ids, submits, synthetic_negatives, [pattern], 1
 
 
 def train(args) -> None:
     device = torch.device(args.device)
-    output_dir = _resolve_output_dir(args.min_submits)
+    if args.binary and args.pattern is not None:
+        raise ValueError("--binary and --pattern cannot be used together.")
+
+    output_dir = _append_pattern_subdir(_resolve_output_dir(args.min_submits), args.pattern)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load dataset summary for label info
@@ -360,11 +422,26 @@ def train(args) -> None:
     data = load_embeddings()
     X_all = data["frames"].float()
     y_all = data["labels"].float()
+    raw_scores = data.get("raw_scores")
+    if raw_scores is None:
+        raise ValueError(
+            "Embeddings file does not contain 'raw_scores'. "
+            "Re-run scripts/extract_embeddings.py to regenerate embeddings with raw pattern metadata."
+        )
+    raw_scores = raw_scores.float()
     urls  = data["urls"]
     tastes_ids = data.get("tastes_ids")
+    submits = data.get("submits")
+    synthetic_negatives = data.get("is_synthetic_negative")
+    if synthetic_negatives is None:
+        synthetic_negatives = (y_all.numpy().sum(axis=1) == 0).tolist()
+
+    if args.pattern is not None:
+        X_all, y_all, raw_scores, urls, tastes_ids, submits, synthetic_negatives, label_cols, n_labels = _apply_pattern_filter(
+            X_all, raw_scores, urls, tastes_ids, submits, synthetic_negatives, label_cols, args.pattern
+        )
 
     if args.min_submits is not None:
-        submits = data.get("submits")
         if submits is None:
             raise ValueError(
                 "Embeddings file does not contain 'submits'. "
@@ -386,7 +463,10 @@ def train(args) -> None:
         submits_arr = np.array([_to_float_or_nan(v) for v in submits], dtype=float)
         urls_arr = np.asarray(urls)
         labels_np = y_all.numpy()
-        is_negative = labels_np.sum(axis=1) == 0
+        if args.pattern is not None:
+            is_negative = labels_np[:, 0] == 0
+        else:
+            is_negative = np.asarray(synthetic_negatives, dtype=bool)
         is_annotated = ~is_negative
 
         keep_annotated = is_annotated & np.isfinite(submits_arr) & (submits_arr >= args.min_submits)
@@ -405,12 +485,14 @@ def train(args) -> None:
                 "Lower the threshold or regenerate embeddings/data."
             )
 
-        keep_idx = torch.from_numpy(np.where(keep_mask)[0]).long()
-        X_all = X_all[keep_idx]
-        y_all = y_all[keep_idx]
+        X_all = _apply_keep_mask(X_all, keep_mask)
+        y_all = _apply_keep_mask(y_all, keep_mask)
+        raw_scores = _apply_keep_mask(raw_scores, keep_mask)
         urls = urls_arr[keep_mask].tolist()
         if tastes_ids is not None:
             tastes_ids = np.asarray(tastes_ids)[keep_mask].tolist()
+        synthetic_negatives = np.asarray(synthetic_negatives, dtype=bool)[keep_mask].tolist()
+        submits = submits_arr[keep_mask].tolist()
 
         print(
             f"[MIN_SUBMITS] threshold={args.min_submits}  "
@@ -521,6 +603,8 @@ def parse_args():
                    help="Number of optimization passes over the tiny set per epoch")
     p.add_argument("--binary",      action="store_true",
                    help="Collapse all labels to a single any-pattern-present binary target")
+    p.add_argument("--pattern",     type=str, default=None, choices=LABEL_NAMES,
+                   help="Train a single-pattern model; positives are exact score 1 and 0.5 rows are excluded")
     p.add_argument("--split-strategy", type=str, default="holdout",
                    choices=["holdout", "kfold"],
                    help="Split strategy: holdout (default) or kfold cross-validation")

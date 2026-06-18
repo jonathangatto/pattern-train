@@ -11,8 +11,11 @@ Imported by:
 from pathlib import Path
 
 # Repository layout
-REPO_ROOT = Path(__file__).resolve().parent
-MODEL_DIR = REPO_ROOT / "models" / "classifier" / "min_submits_93"
+REPO_ROOT      = Path(__file__).resolve().parent
+CLASSIFIER_DIR = REPO_ROOT / "models" / "classifier"
+
+# Specific model loaded by inference.py / evaluate.py
+MODEL_DIR = CLASSIFIER_DIR / "min_submits_93" / "pattern_GRF"
 
 # MERT encoder
 MERT_MODEL = "m-a-p/MERT-v1-330M"
